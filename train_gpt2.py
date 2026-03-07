@@ -173,6 +173,14 @@ class GPT(nn.Module):
     
 
 # -----------------------------------
+# detect device
+device = 'cpu'
+if torch.cuda.is_available():
+    device = 'cuda'
+elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+    device = 'mps'
+print(f"Using device: {device}")
+
 # model = GPT.from_pretrained('gpt2')
 # print("Dont crash yay" )
 
@@ -180,19 +188,35 @@ num_return_sequences = 5
 max_length = 30
 
 
-model = GPT.from_pretrained('gpt2')
-model.eval()
-# model.to('cuda') # enable this if you have GPU
-
 
 # prefix tokens
 import tiktoken
 enc = tiktoken.get_encoding("gpt2")
-tokens = enc.encode("I am a language model,")
-tokens = torch.tensor(tokens, dtype=torch.long)
-tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
-# x = tokens.to('cuda')  # enable this if you have GPU
-x = tokens
+# tokens = enc.encode("I am a language model,")
+# tokens = torch.tensor(tokens, dtype=torch.long)
+# tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+# x = tokens.to(device)  # enable this if you have GPU
+# x = tokens
+
+with open("input.txt", "r") as f:
+    text = f.read()
+
+token = text[:1000]
+tokens = enc.encode(token)
+B, T = 4, 32
+buf = torch.tensor(tokens[:B*T + 1])
+x = buf[:-1].view(B, T)
+y = buf[1:].view(B, T)
+
+# get logits
+# model = GPT.from_pretrained('gpt2')
+model = GPT(GPTConfig())
+# model.eval()
+model.to(device) # enable this if you have GPU
+logits = model(x) # (B, T, vocab_size)
+
+print(logits.shape) # should be (B, T, vocab_size)
+import sys; sys.exit(0)
 
 
 # generate Now, x is (B, T) -> (5, 8)
