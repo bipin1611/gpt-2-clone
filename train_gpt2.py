@@ -39,7 +39,7 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         # attendion (materialize the large (T, T) matrix  for all the queries and keys)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / torch.sqrt(k.size(-1))) # (B, nh, T, T)
+        att = (q @ k.transpose(-2, -1)) * (k.size(-1)**-0.5) # (B, nh, T, T)
         att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf')) # (B, nh, T, T)
         att = F.softmax(att, dim=-1) # (B, nh, T, T)
         y = att @ v # (B, nh, T, hs) * (B, nh, T, hs) -> (B, nh, T, hs)
@@ -102,6 +102,25 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
+    def forward(self, idx):
+        #  idx and targets are both (B, T) tensors of integers
+        B, T = idx.size()
+        assert T <= self.config.block_size, "Cannot forward, model block size is exhausted."
+
+        # forward the GPT model itself
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # (1, T)
+        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (T, n_embd)
+        tok_emb = self.transformer.wte(idx) # token embeddings of shape (B, T, n_embd)
+        x = tok_emb + pos_emb # (B, T, n_embd)
+
+        #  forward the blocks
+        for block in self.transformer.h:
+            x = block(x)
+
+        #  forward the final layer norm and the classifier head
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x) # (B, T, vocab_size)
+        return logits
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -154,5 +173,59 @@ class GPT(nn.Module):
     
 
 # -----------------------------------
+# model = GPT.from_pretrained('gpt2')
+# print("Dont crash yay" )
+
+num_return_sequences = 5
+max_length = 30
+
+
 model = GPT.from_pretrained('gpt2')
-print("Dont crash yay" )
+model.eval()
+# model.to('cuda') # enable this if you have GPU
+
+
+# prefix tokens
+import tiktoken
+enc = tiktoken.get_encoding("gpt2")
+tokens = enc.encode("I am a language model,")
+tokens = torch.tensor(tokens, dtype=torch.long)
+tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+# x = tokens.to('cuda')  # enable this if you have GPU
+x = tokens
+
+
+# generate Now, x is (B, T) -> (5, 8)
+# set the seed to 42
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
+
+while x.size(1) < max_length:
+    with torch.no_grad():
+        logits = model(x) # B, T, vocab_size
+
+        # take the logits from the final step and scale by temperature
+        logits = logits[:, -1, :] # (B, vocab_size)
+        
+        # get the probabilities
+        probs = F.softmax(logits, dim=-1) # (B, vocab_size)
+
+        #  do top-k sampling of 50 (huggingface's pipeline default)
+        # topk_probs become (5, 50), topk_indices (5, 50)
+        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+
+        # select a token from the top-k candidates and add it to the sequence
+        ix = torch.multinomial(topk_probs, 1) # (B  1)
+
+        #  gather the corresponding indices
+        xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
+
+        # append to the sequeces
+        x = torch.cat((x, xcol), dim=1) # (B, T+1)
+
+
+#  decode the generated tokens
+for i in range(num_return_sequences):
+    tokens = x[i, :max_length].tolist()
+    text = enc.decode(tokens)
+    print(f"> {text}")
