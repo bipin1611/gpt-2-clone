@@ -42,10 +42,12 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         # attendion (materialize the large (T, T) matrix  for all the queries and keys)
-        att = (q @ k.transpose(-2, -1)) * (k.size(-1)**-0.5) # (B, nh, T, T)
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf')) # (B, nh, T, T)
-        att = F.softmax(att, dim=-1) # (B, nh, T, T)
-        y = att @ v # (B, nh, T, hs) * (B, nh, T, hs) -> (B, nh, T, hs)
+        # att = (q @ k.transpose(-2, -1)) * (k.size(-1)**-0.5) # (B, nh, T, T)
+        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf')) # (B, nh, T, T)
+        # att = F.softmax(att, dim=-1) # (B, nh, T, T)
+        # y = att @ v # (B, nh, T, hs) * (B, nh, T, hs) -> (B, nh, T, hs)
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=self.bias[:,:,:T,:T]) # (B, nh, T, hs)
+
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side (B, T, nh*hs)
 
         #  output projection
@@ -197,6 +199,7 @@ class GPT(nn.Module):
     
 
 # -----------------------------------
+import time
 # detect device
 device = 'cpu'
 if torch.cuda.is_available():
@@ -258,23 +261,37 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(1337)
 
 # get a data batch
-train_loader = DataLoaderLite(B=4, T=32)
+train_loader = DataLoaderLite(B=4, T=256)
+
+torch.set_float32_matmul_precision('high')
 
 # get logits
 model = GPT(GPTConfig())
 # model.eval()
 model.to(device) # enable this if you have GPU
+if device == 'cuda':
+    model = torch.compile(model) # enable this if you have PyTorch 2.
 
 # optimizer
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-for i in range(50):
+for i in range(20):
+    t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device) # enable this if you have GPU
     optimizer.zero_grad()
-    logits, loss = model(x, y)
+    if device == 'cuda':
+        with torch.autocast(device_type=device, dtype=torch.bfloat16): # enable this if you have GPU with tensor cores
+            logits, loss = model(x, y)
+    else:
+        logits, loss = model(x, y)
     loss.backward()
     optimizer.step()
-    print(f"step {i}: loss {loss.item():.4f}")
+    if device == 'cuda':
+        torch.cuda.synchronize() # enable this if you have GPU
+    t1 = time.time()
+    dt = (t1 - t0) * 1000
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    print(f"step {i}: loss {loss.item():.4f} ({dt:.2f}ms), token/sec {tokens_per_sec:.2f}")
     
 
 # print(loss) # should be (B, T, vocab_size)
