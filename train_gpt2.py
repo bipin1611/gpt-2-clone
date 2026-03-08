@@ -197,6 +197,31 @@ class GPT(nn.Module):
 
         return model
     
+    def configure_optimizers(self, weight_decay, learning_rate, device_type):
+        # start with all of the candidate parameters (that require grad)
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        if master_process:
+            print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+            print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # Create AdamW optimizer and use the fused version if it is available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device_type == "cuda"
+        if master_process:
+            print(f"using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        return optimizer
+    
 
 # -----------------------------------
 import time
@@ -266,15 +291,38 @@ train_loader = DataLoaderLite(B=4, T=256)
 torch.set_float32_matmul_precision('high')
 
 # get logits
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304))
 # model.eval()
 model.to(device) # enable this if you have GPU
 if device == 'cuda':
     model = torch.compile(model) # enable this if you have PyTorch 2.
 
+
+import math
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps = 50
+def get_lr(it):
+    # 1. linear warmup for the first warmup_steps
+    if it < warmup_steps:
+        return max_lr * (it + 1) / warmup_steps
+    
+    # 2. cosine decay for the remaining steps
+    if it > max_steps:
+        return min_lr
+    
+    # 3. cosine decay calculation
+    decay_steps = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_steps <= 1, "decay_steps should be in the range [0, 1]"
+    coeff = 0.5 * (1 + math.cos(math.pi * decay_steps)) # cosine decay coefficient
+    return min_lr + coeff * (max_lr - min_lr)
+    
+
 # optimizer
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-for i in range(20):
+# optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device)
+for step in range(max_steps):
     t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device) # enable this if you have GPU
@@ -285,13 +333,20 @@ for i in range(20):
     else:
         logits, loss = model(x, y)
     loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # clip the gradient to prevent exploding gradients
+
+    # determine the learning rate for this iteration
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+
     optimizer.step()
     if device == 'cuda':
         torch.cuda.synchronize() # enable this if you have GPU
     t1 = time.time()
     dt = (t1 - t0) * 1000
     tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-    print(f"step {i}: loss {loss.item():.4f} ({dt:.2f}ms), token/sec {tokens_per_sec:.2f}")
+    print(f"step {step}: loss {loss.item():.4f} ({dt:.2f}ms) | lr {lr:.2e} | norm {norm.item():.4f} | token/sec {tokens_per_sec:.2f}")
     
 
 # print(loss) # should be (B, T, vocab_size)
