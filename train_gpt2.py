@@ -284,8 +284,15 @@ torch.manual_seed(1337) # for reproducibility
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(1337)
 
+total_batch_size = 524288 # 512K tokens per batch, i.e. 512 sequences of length 1024, which is the block size of the model
+B = 4 # batch size
+T = 256 # sequence length, i.e. the context window of the model, which can be less than or equal to the block size
+assert total_batch_size % (B * T) == 0, "total_batch_size must be divisible by B * T"
+grad_accum_steps = total_batch_size // (B * T)
+print(f"total_batch_size {total_batch_size} = B {B} * T {T} * grad_accum_steps {grad_accum_steps}")
+
 # get a data batch
-train_loader = DataLoaderLite(B=4, T=256)
+train_loader = DataLoaderLite(B=B, T=T)
 
 torch.set_float32_matmul_precision('high')
 
